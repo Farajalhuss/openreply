@@ -51,25 +51,6 @@ function formatError(error: unknown): string {
   return "Unknown error";
 }
 
-// Meta rejections that a plain-text retry cannot fix: the send was refused for
-// the conversation, not for the button template. Retrying as text just burns
-// the attempt and — worse — overwrites the real error with a misleading one
-// ("invalid for a private reply", because the first attempt already used up the
-// comment's single allowed private reply).
-const NON_TEMPLATE_REJECTIONS = [
-  /outside of allowed window/i,
-  /invalid for a private reply/i,
-  /requested user cannot be found/i,
-];
-
-function isTemplateRejection(error: unknown): boolean {
-  if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
-    return false;
-  }
-  const message = error instanceof Error ? error.message : "";
-  return !NON_TEMPLATE_REJECTIONS.some((pattern) => pattern.test(message));
-}
-
 type WorkerTrackedLink = {
   slug: string;
   label: string | null;
@@ -89,24 +70,6 @@ function buildLinkButtons(
     url: buildTrackedUrl(link.slug),
     title: (index === 0 ? primaryLabel : link.label) || link.label || "Open link",
   }));
-}
-
-/**
- * Fallback text when Meta rejects the button template: render the primary link
- * inline, then append any extra tracked URLs on their own lines so no link is
- * lost.
- */
-function buildInlineLinkFallback(
-  message: string,
-  commenterName: string | null | undefined,
-  trackedLinks: WorkerTrackedLink[],
-  bodyText: string
-): string {
-  const base =
-    renderMessageWithTracking({ message, commenterName, trackedLinks }) ||
-    bodyText;
-  const extraUrls = trackedLinks.slice(1).map((link) => buildTrackedUrl(link.slug));
-  return extraUrls.length > 0 ? `${base}\n${extraUrls.join("\n")}` : base;
 }
 
 type RevealAutomation = {
@@ -142,7 +105,10 @@ async function sendRevealDirectMessage(
     return;
   }
 
-  // Try button template first; if Meta rejects it, fall back to inline links.
+  // Button template only. A rejected template is left to the queue's normal
+  // retries rather than degraded into a plain-text message: the raw tracked URL
+  // and Instagram's auto-preview card look off-brand, so no message is better
+  // than an ugly one.
   const bodyText =
     renderMessageWithoutLink({
       message: automation.dmMessage,
@@ -153,39 +119,13 @@ async function sendRevealDirectMessage(
     automation.linkButtonLabel
   );
 
-  try {
-    await sendDirectMessageWithLinkButton(
-      accessToken,
-      automation.instagramAccount.instagramId,
-      userId,
-      bodyText,
-      buttons
-    );
-  } catch (buttonError) {
-    // A closed messaging window rejects the text retry too, so don't let it
-    // overwrite the original error with a misleading one.
-    if (!isTemplateRejection(buttonError)) throw buttonError;
-
-    console.log(
-      `[DM Worker] Button template rejected in ${context}, falling back to inline link:`,
-      formatError(buttonError)
-    );
-    try {
-      await sendDirectMessage(
-        accessToken,
-        automation.instagramAccount.instagramId,
-        userId,
-        buildInlineLinkFallback(
-          automation.dmMessage,
-          commenterName,
-          automation.trackedLinks,
-          bodyText
-        )
-      );
-    } catch {
-      throw buttonError;
-    }
-  }
+  await sendDirectMessageWithLinkButton(
+    accessToken,
+    automation.instagramAccount.instagramId,
+    userId,
+    bodyText,
+    buttons
+  );
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -573,7 +513,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           `followcheck:${automation.id}`
         );
       } else if (automation.trackedLinks.length > 0) {
-        // Try button template first; if Meta rejects it, fall back to inline links.
         const bodyText =
           renderMessageWithoutLink({
             message: automation.dmMessage,
@@ -584,44 +523,16 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           automation.linkButtonLabel
         );
 
-        try {
-          await sendPrivateReplyWithLinkButton(
-            accessToken,
-            automation.instagramAccount.instagramId,
-            commentId,
-            bodyText,
-            buttons
-          );
-        } catch (buttonError) {
-          // Only a template rejection is worth retrying as text. Anything else
-          // (closed window, comment already replied to) fails the same way and
-          // would replace the real error with a misleading one.
-          if (!isTemplateRejection(buttonError)) throw buttonError;
-
-          console.log(
-            "[DM Worker] Button template rejected, falling back to inline link:",
-            formatError(buttonError)
-          );
-          const fallbackMessage = buildInlineLinkFallback(
-            automation.dmMessage,
-            commenterName,
-            automation.trackedLinks,
-            bodyText
-          );
-          try {
-            await sendPrivateReply(
-              accessToken,
-              automation.instagramAccount.instagramId,
-              commentId,
-              fallbackMessage
-            );
-          } catch {
-            // The first attempt consumed the comment's single private reply, so
-            // this one reports "invalid for a private reply" no matter what the
-            // underlying problem was. Surface the original rejection instead.
-            throw buttonError;
-          }
-        }
+        // Button template only — see the note in sendLinkDirectMessage. A
+        // rejected template surfaces as a failed job instead of degrading into
+        // a plain-text message with a raw tracked URL.
+        await sendPrivateReplyWithLinkButton(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          commentId,
+          bodyText,
+          buttons
+        );
       } else {
         const dmMessage = renderMessageWithTracking({
           message: automation.dmMessage,
